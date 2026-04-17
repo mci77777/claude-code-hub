@@ -40,28 +40,7 @@ function extractClientIp(session: ProxySession): string {
 
 export class ProxyAuthenticator {
   static async ensure(session: ProxySession): Promise<Response | null> {
-    // Pre-auth rate limit: block IPs with too many recent auth failures
     const clientIp = extractClientIp(session);
-    const rateLimitDecision = proxyAuthPolicy.check(clientIp);
-    if (!rateLimitDecision.allowed) {
-      const retryAfter = rateLimitDecision.retryAfterSeconds;
-      const response = ProxyResponses.buildError(
-        429,
-        "Too many authentication failures. Please retry later.",
-        "rate_limit_error"
-      );
-      if (retryAfter != null) {
-        const headers = new Headers(response.headers);
-        headers.set("Retry-After", String(retryAfter));
-        return new Response(response.body, {
-          status: response.status,
-          statusText: response.statusText,
-          headers,
-        });
-      }
-      return response;
-    }
-
     const authHeader = session.headers.get("authorization") ?? undefined;
     const apiKeyHeader = session.headers.get("x-api-key") ?? undefined;
     // Gemini CLI 认证：支持 x-goog-api-key 头部和 key 查询参数
@@ -77,15 +56,45 @@ export class ProxyAuthenticator {
     session.setAuthState(authState);
 
     if (authState.success) {
-      proxyAuthPolicy.recordSuccess(clientIp);
+      proxyAuthPolicy.recordSuccess(clientIp, authState.apiKey ?? undefined);
       return null;
     }
 
-    // Record failure for rate limiting
-    proxyAuthPolicy.recordFailure(clientIp);
+    const apiKey = authState.apiKey ?? undefined;
+    proxyAuthPolicy.recordFailure(clientIp, apiKey);
+
+    const rateLimitDecision = proxyAuthPolicy.check(clientIp, apiKey);
+    if (!rateLimitDecision.allowed) {
+      logger.warn("[ProxyAuthenticator] Authentication rate limit triggered", {
+        clientIp,
+        reason: rateLimitDecision.reason,
+        retryAfterSeconds: rateLimitDecision.retryAfterSeconds,
+        hasApiKey: !!apiKey,
+      });
+      return ProxyAuthenticator.buildRateLimitResponse(rateLimitDecision.retryAfterSeconds);
+    }
 
     // 返回详细的错误信息，帮助用户快速定位问题
     return authState.errorResponse ?? ProxyResponses.buildError(401, "认证失败");
+  }
+
+  private static buildRateLimitResponse(retryAfterSeconds?: number): Response {
+    const response = ProxyResponses.buildError(
+      429,
+      "Too many authentication failures. Please retry later.",
+      "rate_limit_error"
+    );
+    if (retryAfterSeconds == null) {
+      return response;
+    }
+
+    const headers = new Headers(response.headers);
+    headers.set("Retry-After", String(retryAfterSeconds));
+    return new Response(response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers,
+    });
   }
 
   private static async validate(headers: {
